@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ask Stark</title>
+<!-- sql.js (SQLite compiled to WebAssembly) runs the curated database entirely in
+     the browser. pako inflates the pre-gzipped database. engine.js is the
+     deterministic core. ALL of these are vendored in the repo (lib/) so the page's
+     ONLY outside call is to api.anthropic.com -- no third-party CDN to be blocked. -->
+<script src="lib/sql-wasm.js"></script>
+<script src="lib/pako.min.js"></script>
+<script src="engine.js"></script>
+<style>
+  :root{
+    --teal:#0f7d7d; --teal-d:#0a5c5c; --ink:#1b2a2a; --muted:#5c6b6b;
+    --line:#d8e3e3; --bg:#f4f7f7; --card:#ffffff; --warn:#8a5a00; --warn-bg:#fff6e6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;line-height:1.5}
+  header{background:var(--teal);color:#fff;padding:18px 20px}
+  header h1{margin:0;font-size:20px;font-weight:700;letter-spacing:.2px}
+  header p{margin:4px 0 0;font-size:13px;opacity:.9}
+  main{max-width:760px;margin:0 auto;padding:20px 16px 80px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+        padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+  .muted{color:var(--muted)}
+  .small{font-size:13px}
+  .figs{margin:6px 0 2px}
+  .fig-lead{font-size:26px;font-weight:700;color:var(--teal-d)}
+  .fig{font-size:15px;color:var(--ink)}
+  label{display:block;font-size:13px;font-weight:600;margin:0 0 4px}
+  input[type=text],input[type=password]{width:100%;padding:10px 12px;font-size:15px;
+        border:1px solid var(--line);border-radius:8px;background:#fff}
+  button{background:var(--teal);color:#fff;border:0;border-radius:8px;padding:10px 16px;
+        font-size:15px;font-weight:600;cursor:pointer}
+  button:hover{background:var(--teal-d)}
+  button.link{background:none;color:var(--teal-d);padding:4px 0;font-weight:600;
+        text-decoration:underline}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+  .chip{background:#eaf3f3;border:1px solid var(--line);color:var(--teal-d);border-radius:16px;
+        padding:6px 12px;font-size:13px;cursor:pointer}
+  .chip:hover{background:#dcecec}
+  .askrow{display:flex;gap:8px;margin-top:6px}
+  .askrow input{flex:1}
+  .badge{display:inline-block;font-size:11px;font-weight:700;text-transform:uppercase;
+        letter-spacing:.4px;color:var(--teal-d);background:#eaf3f3;border-radius:4px;
+        padding:2px 6px;margin-bottom:6px}
+  .params{font-size:13px;color:var(--muted);margin:8px 0 0}
+  .note{font-size:12px;color:var(--muted);margin-top:10px;border-top:1px solid var(--line);
+        padding-top:8px}
+  .provenance{font-size:12px;color:var(--muted);margin-top:6px;font-style:italic}
+  .refusal{border-left:3px solid var(--warn);background:var(--warn-bg)}
+  .referral a{color:var(--teal-d);font-weight:600}
+  .loading{color:var(--muted);font-size:14px}
+  a.btnlink{display:inline-block;margin-top:8px;background:var(--teal);color:#fff;
+        text-decoration:none;border-radius:8px;padding:8px 14px;font-size:14px;font-weight:600}
+  .err{color:#a11;font-size:13px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Ask Stark</h1>
+  <p>Plain-English answers from Stark County Auditor public records &middot; preview</p>
+</header>
+<main>
+  <div id="gate" class="card" hidden>
+    <label for="key">Anthropic API key</label>
+    <input id="key" type="password" placeholder="sk-ant-..." autocomplete="off">
+    <p class="small muted">Stored only in this browser (sent only to Anthropic, never
+      to any other server). Paste the key the office gave you.</p>
+    <button id="savekey">Save key</button>
+    <div id="keyerr" class="err" hidden></div>
+  </div>
+
+  <div id="boot" class="card">
+    <div class="loading" id="bootmsg">Loading the records database&hellip;</div>
+  </div>
+
+  <div id="ask" hidden>
+    <div class="card">
+      <label for="q">Ask a question</label>
+      <div class="askrow">
+        <input id="q" type="text" placeholder="How many homes are in Jackson Township?"
+               autocomplete="off">
+        <button id="send">Ask</button>
+      </div>
+      <div class="chips" id="chips"></div>
+      <div id="asker" class="err" hidden></div>
+      <div class="small muted" id="startover" style="margin-top:10px" hidden>
+        <button class="link" id="reset">Start over</button> &middot; drilling into the
+        previous answer
+      </div>
+    </div>
+    <div id="transcript"></div>
+  </div>
+</main>
+
+<script>
+"use strict";
+// The language model call goes straight from this browser to Anthropic, using the
+// key the user pasted (kept in localStorage). Same pattern as the CAMA review
+// portal. Everything deterministic lives in engine.js (window.AskStarkEngine).
+const E = window.AskStarkEngine;
+const MODEL = "claude-sonnet-5";        // classification only; ~2.5x cheaper than Opus. One-line swap.
+const KEY_STORE = "anthropic_api_key";
+let priorContext = null;
+
+// ---- The ONE model call: map a question to a metric + parameters -----------
+async function mapQuestion(question, prior){
+  const key=localStorage.getItem(KEY_STORE);
+  let content=question;
+  if(prior && prior.metric){
+    const ps=Object.entries(prior.params||{}).map(([k,v])=>`${k}=${v}`).join(", ");
+    content=`PREVIOUS RESULT: metric=${prior.metric}${ps?"; parameters: "+ps:""}\n\nNEW QUESTION: ${question}`;
+  }
+  const resp=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"content-type":"application/json","x-api-key":key,
+      "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:MODEL, max_tokens:1024, thinking:{type:"disabled"},
+      system:E.systemPrompt(),
+      tools:[E.intentTool()], tool_choice:{type:"tool",name:"resolve_intent"},
+      messages:[{role:"user",content}]})
+  });
+  if(!resp.ok){
+    const t=await resp.text();
+    throw new Error(resp.status===401?"That API key was rejected. Check the key and try again.":
+      `The AI request failed (${resp.status}). ${t.slice(0,140)}`);
+  }
+  const data=await resp.json();
+  const tu=(data.content||[]).find(b=>b.type==="tool_use");
+  if(!tu) throw new Error("The AI did not return a mapping. Try rephrasing.");
+  return tu.input;
+}
+
+// ---- Orchestration (mirror qa.resolve) -------------------------------------
+async function resolve(question){
+  const intent=await mapQuestion(question, priorContext);
+  const metric=intent.metric, conf=intent.confidence;
+  const continues=!!intent.continues && !!priorContext;
+  if(metric==="none" || conf==="low"){
+    const ref=(metric==="none")?E.REFERRALS[intent.referral]:null;
+    return {status:"refusal", message:"I don't have that.", reason:intent.reasoning||"", referral:ref};
+  }
+  const params={};
+  for(const k of E.PARAM_KEYS){ const v=intent[k]; if(v!=null && v!=="unspecified" && v!=="") params[k]=v; }
+  const res=E.runMetric(metric, params);
+  if(res.status==="ok"){
+    priorContext={metric, params:res.chosen};
+    const m=E.METRICS[metric]; let note=m.provenance;
+    if(res.chosen.city && res.chosen.city!=="all") note+=` City filter “${res.chosen.city}” is the situs (mailing) city, not the taxing township.`;
+    if(res.chosen.township && res.chosen.township!=="all") note+=` Township filter “${res.chosen.township}” is the taxing jurisdiction (excludes city parcels).`;
+    if(res.chosen.school_district && res.chosen.school_district!=="all") note+=` School-district filter “${res.chosen.school_district}” can span several cities/townships.`;
+    return {status:"answer", metric, label:m.label, continues,
+      figures:m.headline(res.row, res.chosen),
+      params:Object.entries(res.chosen).filter(([k])=>!E.HIDDEN.includes(k)),
+      note, coverage:res.coverage};
+  }
+  return {status:"refusal", message:E.renderNonOk(res), referral:null};
+}
+
+// ---- UI --------------------------------------------------------------------
+const $=id=>document.getElementById(id);
+const EXAMPLES=["How many homes are in Jackson Township?",
+  "Median home sale price in Massillon last year",
+  "Average property value in Plain Local Schools",
+  "How many new homes were built in North Canton in 2025?",
+  "How many BOR complaints were reduced in 2024?",
+  "How many ranch homes in Perry Township?"];
+function esc(s){return String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));}
+
+function renderCard(question, out){
+  const t=$("transcript"); const c=document.createElement("div");
+  c.className="card"+(out.status==="refusal"?" refusal":"");
+  let h=`<div class="badge">${out.continues?"&#8627; refining":"you asked"}</div>`;
+  h+=`<div class="small muted">“${esc(question)}”</div>`;
+  if(out.status==="answer"){
+    h+=`<div class="figs">`;
+    out.figures.forEach((f,i)=>{ h+=`<div class="${i===0?"fig-lead":"fig"}">${esc(f)}</div>`; });
+    h+=`</div><div class="params">${esc(out.label)}`;
+    const extra=out.params.filter(([k,v])=>v!=null&&v!=="all").map(([k,v])=>`${k}=${v}`);
+    if(extra.length) h+=" &middot; "+esc(extra.join(", "));
+    h+=`</div><div class="note">${esc(out.note)}</div>`;
+    h+=`<div class="provenance">Data refreshed ${esc(out.coverage.refreshed_at||"?")} from iasWorld (read-only); coverage ${out.coverage.min_year}-${out.coverage.max_year}.</div>`;
+  } else {
+    h+=`<div class="figs"><div class="fig" style="font-weight:600">${esc(out.message)}</div></div>`;
+    if(out.reason) h+=`<div class="small muted">${esc(out.reason)}</div>`;
+    if(out.referral) h+=`<div class="referral small" style="margin-top:8px">${esc(out.referral.message)}<br><a class="btnlink" href="${out.referral.url}" target="_blank" rel="noopener">${esc(out.referral.label)} &rarr;</a></div>`;
+  }
+  c.innerHTML=h; t.prepend(c);
+}
+
+async function onAsk(){
+  const q=$("q").value.trim(); if(!q) return;
+  $("asker").hidden=true; $("send").disabled=true; $("send").textContent="…";
+  try{
+    const out=await resolve(q);
+    renderCard(q, out);
+    $("q").value="";
+    $("startover").hidden = !(out.status==="answer");
+  }catch(e){
+    $("asker").textContent=e.message||String(e); $("asker").hidden=false;
+  }finally{
+    $("send").disabled=false; $("send").textContent="Ask";
+  }
+}
+
+function initChips(){
+  const box=$("chips");
+  EXAMPLES.forEach(x=>{ const b=document.createElement("span"); b.className="chip"; b.textContent=x;
+    b.onclick=()=>{ $("q").value=x; onAsk(); }; box.appendChild(b); });
+}
+function showApp(){ $("boot").hidden=true; $("ask").hidden=false; }
+function needKey(){
+  $("gate").hidden=false;
+  $("savekey").onclick=()=>{
+    const k=$("key").value.trim();
+    if(!k.startsWith("sk-ant")){ $("keyerr").textContent="That doesn't look like an Anthropic key (sk-ant-...)."; $("keyerr").hidden=false; return; }
+    localStorage.setItem(KEY_STORE,k); $("gate").hidden=true; boot();
+  };
+}
+
+async function boot(){
+  if(!localStorage.getItem(KEY_STORE)){ needKey(); return; }
+  try{
+    $("bootmsg").textContent="Loading the records database (~13 MB, one time)…";
+    const SQL=await initSqlJs({locateFile:f=>"lib/"+f});
+    const buf=await (await fetch("askstark-web.db.gz")).arrayBuffer();
+    const bytes=pako.inflate(new Uint8Array(buf));
+    E.setDb(new SQL.Database(bytes));
+    showApp();
+  }catch(e){
+    $("bootmsg").innerHTML=`<span class="err">Could not load the database: ${esc(e.message||e)}</span>`;
+  }
+}
+
+$("send").onclick=onAsk;
+$("q").addEventListener("keydown",e=>{ if(e.key==="Enter") onAsk(); });
+$("reset").onclick=()=>{ priorContext=null; $("startover").hidden=true; };
+initChips();
+boot();
+</script>
+</body>
+</html>
